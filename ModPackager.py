@@ -1,6 +1,8 @@
-import json
+﻿import json
 import os
 import zipfile
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import mobase
 from PyQt6.QtCore import Qt
@@ -9,6 +11,7 @@ from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
 CODE_EXT = (".esp", ".esm", ".esl", ".dll")
 STORED_EXT = (".bsa", ".ba2", ".zip", ".7z", ".rar", ".png", ".jpg", ".mp3", ".ogg", ".xwm", ".fuz")  # already compressed
+PARALLEL_MAX, BATCH = 16 * 2**20, 16  # bounds memory to ~256 MB in flight
 GAME_FILES = ("enb", "skse64", "d3d11.dll", "d3dcompiler_46e.dll", "dxgi.dll")
 PROFILE_CONFIGS = ("skyrim.ini", "skyrimprefs.ini", "skyrimcustom.ini")
 
@@ -33,12 +36,42 @@ def scan(path, need_size):
     return code, size
 
 
-def add_tree(z, src, arc):
+def pack(item):
+    full, name = item
+    with open(full, "rb") as f:
+        raw = f.read()
+    c = zlib.compressobj(1, zlib.DEFLATED, -15)
+    info = zipfile.ZipInfo.from_file(full, name, strict_timestamps=False)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    return info, c.compress(raw) + c.flush(), zlib.crc32(raw), len(raw)
+
+
+def write_raw(z, info, data, crc, size):
+    # shortcut: uses zipfile internals (stable 3.8-3.14) to write pre-compressed data; replace if a zipfile update breaks it
+    info.CRC, info.file_size, info.compress_size, info.header_offset = crc, size, len(data), z.fp.tell()
+    z.fp.write(info.FileHeader())
+    z.fp.write(data)
+    z.start_dir = z.fp.tell()
+    z.filelist.append(info)
+    z.NameToInfo[info.filename] = info
+
+
+def add_tree(z, src, arc, pool, compress):
+    """Small compressible files are deflated in parallel threads; everything else goes through z.write."""
+    small = []
     for root, _, files in os.walk(src):
         for f in files:
             full = os.path.join(root, f)
-            kind = zipfile.ZIP_STORED if f.lower().endswith(STORED_EXT) else zipfile.ZIP_DEFLATED
-            z.write(full, arc + "/" + os.path.relpath(full, src).replace(os.sep, "/"), compress_type=kind)
+            name = arc + "/" + os.path.relpath(full, src).replace(os.sep, "/")
+            size = os.path.getsize(full)
+            if compress and 0 < size <= PARALLEL_MAX and not f.lower().endswith(STORED_EXT):
+                small.append((full, name))
+            else:
+                kind = zipfile.ZIP_DEFLATED if compress and not f.lower().endswith(STORED_EXT) else zipfile.ZIP_STORED
+                z.write(full, name, compress_type=kind)
+    for i in range(0, len(small), BATCH):
+        for result in pool.map(pack, small[i:i + BATCH]):
+            write_raw(z, *result)
 
 
 def extract_tree(z, prefix, dest):
@@ -76,7 +109,8 @@ class Export(Base):
     def settings(self):
         return [mobase.PluginSetting("max-mod-mb", "Mods larger than this (MB) are listed instead of copied; 0 = no limit", 0),
                 mobase.PluginSetting("only-active", "Export only mods enabled in the current profile", True),
-                mobase.PluginSetting("list-replacers", "Also list mods without plugins/dlls (name + URL) in replacers.txt", True)]
+                mobase.PluginSetting("compress", "Compress the zip (smaller but slower); off = store only", True),
+                mobase.PluginSetting("export-replacers", "Also copy the files of mods without plugins/dlls (they are always listed in replacers.txt)", False)]
 
     def display(self):
         out, _ = QFileDialog.getSaveFileName(self.w, "Export modpack", "modpack.zip", "Zip (*.zip)")
@@ -85,7 +119,9 @@ class Export(Base):
         ml, manifest, replacers = self.o.modList(), [], []
         limit = int(self.o.pluginSetting(self.name(), "max-mod-mb"))
         only_active = bool(self.o.pluginSetting(self.name(), "only-active"))
-        list_replacers = bool(self.o.pluginSetting(self.name(), "list-replacers"))
+        export_replacers = bool(self.o.pluginSetting(self.name(), "export-replacers"))
+        compress = bool(self.o.pluginSetting(self.name(), "compress"))
+        pool = ThreadPoolExecutor(os.cpu_count())
         names = ml.allModsByProfilePriority()
         bar = progress(self.w, "Exporting...", len(names))
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=1, strict_timestamps=False) as z:
@@ -100,15 +136,13 @@ class Export(Base):
                     continue
                 path = mod.absolutePath()
                 code, size = scan(path, bool(limit))
-                if not code and not list_replacers:
-                    continue
-                full = code and not (limit and size / 2**20 > limit)
+                full = (code or export_replacers) and not (limit and size / 2**20 > limit)
                 manifest.append({"name": name, "url": mod.url(), "full": full, "enabled": active})
                 if full:
-                    add_tree(z, path, "mods/" + name)
-                else:
+                    add_tree(z, path, "mods/" + name, pool, compress)
+                if not code or not full:
                     replacers.append(f"{name}\t{mod.url()}")
-            add_tree(z, self.o.overwritePath(), "configs/overwrite")
+            add_tree(z, self.o.overwritePath(), "configs/overwrite", pool, compress)
             for f in os.listdir(self.o.profilePath()):
                 if f.lower() in PROFILE_CONFIGS:
                     z.write(os.path.join(self.o.profilePath(), f), "configs/profile/" + f)
@@ -121,8 +155,9 @@ class Export(Base):
                 if os.path.isfile(os.path.join(game, f)) and f.lower().startswith(GAME_FILES):
                     z.write(os.path.join(game, f), f)
             if os.path.isdir(os.path.join(game, "enbseries")):
-                add_tree(z, os.path.join(game, "enbseries"), "enbseries")
-        QMessageBox.information(self.w, "Export", f"{len(manifest) - len(replacers)} mods packed, "
+                add_tree(z, os.path.join(game, "enbseries"), "enbseries", pool, compress)
+        pool.shutdown()
+        QMessageBox.information(self.w, "Export", f"{sum(m["full"] for m in manifest)} mods packed, "
                                                   f"{len(replacers)} replacers listed.\n"
                                                   "ENB/SKSE game files saved to the *_game.zip next to it.")
 
