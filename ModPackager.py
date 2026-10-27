@@ -148,6 +148,9 @@ class Export(Base):
                     z.write(os.path.join(self.o.profilePath(), f), "configs/profile/" + f)
             z.writestr("manifest.json", json.dumps(manifest, indent=1))
             z.writestr("replacers.txt", "\n".join(replacers))
+            pl = self.o.pluginList()
+            active = sorted((p for p in pl.pluginNames() if pl.state(p) == mobase.PluginState.ACTIVE), key=pl.loadOrder)
+            z.writestr("plugins.json", json.dumps(active, indent=1))
         bar.close()
         game = self.o.managedGame().gameDirectory().absolutePath()
         with zipfile.ZipFile(out[:-4] + "_game.zip", "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as z:
@@ -172,6 +175,7 @@ class Import(Base):
         missing, added = [], []
         with zipfile.ZipFile(src) as z:
             manifest = json.loads(z.read("manifest.json"))
+            plugins = json.loads(z.read("plugins.json"))
             bar = progress(self.w, "Importing...", len(manifest))
             for i, m in enumerate(manifest):
                 bar.setLabelText(m["name"])
@@ -188,8 +192,16 @@ class Import(Base):
             extract_tree(z, "configs/profile/", self.o.profilePath())
         bar.close()
         self.o.refresh()
+        ml, pl = self.o.modList(), self.o.pluginList()
         for n in added:
-            self.o.modList().setActive(n, True)
+            ml.setActive(n, True)
+        # shortcut: mods missing from the manifest (e.g. uninstalled replacers) are skipped; others not in it end up after
+        for i, n in enumerate(n for n in (m["name"] for m in manifest) if ml.getMod(n)):
+            ml.setPriority(n, i)
+        present = [p for p in plugins if pl.state(p) != mobase.PluginState.MISSING]
+        for p in present:
+            pl.setState(p, mobase.PluginState.ACTIVE)
+        pl.setLoadOrder(present)
         QMessageBox.information(self.w, "Import", "Install these manually:\n\n" + "\n".join(missing))
 
 
