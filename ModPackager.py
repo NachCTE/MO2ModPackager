@@ -8,6 +8,7 @@ from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
 CODE_EXT = (".esp", ".esm", ".esl", ".dll")
+STORED_EXT = (".bsa", ".ba2", ".zip", ".7z", ".rar", ".png", ".jpg", ".mp3", ".ogg", ".xwm", ".fuz")  # already compressed
 GAME_FILES = ("enb", "skse64", "d3d11.dll", "d3dcompiler_46e.dll", "dxgi.dll")
 PROFILE_CONFIGS = ("skyrim.ini", "skyrimprefs.ini", "skyrimcustom.ini")
 
@@ -19,15 +20,25 @@ def progress(parent, text, total):
     return bar
 
 
-def has_code(path):
-    return any(f.lower().endswith(CODE_EXT) for _, _, fs in os.walk(path) for f in fs)
+def scan(path, need_size):
+    """One pass: (has code files, size in bytes). Stops at the first code file if size isn't needed."""
+    code, size = False, 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            code = code or f.lower().endswith(CODE_EXT)
+            if need_size:
+                size += os.path.getsize(os.path.join(root, f))
+        if code and not need_size:
+            break
+    return code, size
 
 
 def add_tree(z, src, arc):
     for root, _, files in os.walk(src):
         for f in files:
             full = os.path.join(root, f)
-            z.write(full, arc + "/" + os.path.relpath(full, src).replace(os.sep, "/"))
+            kind = zipfile.ZIP_STORED if f.lower().endswith(STORED_EXT) else zipfile.ZIP_DEFLATED
+            z.write(full, arc + "/" + os.path.relpath(full, src).replace(os.sep, "/"), compress_type=kind)
 
 
 def extract_tree(z, prefix, dest):
@@ -51,7 +62,7 @@ class Base(mobase.IPluginTool):
     def name(self): return "ModPackager " + self.title
     def author(self): return "Nacho"
     def description(self): return self.title + " modpack (mods with plugins/dlls, replacer list, configs)"
-    def version(self): return mobase.VersionInfo(1, 0, 0, mobase.VersionInfo.ReleaseType.FINAL)
+    def version(self): return mobase.VersionInfo(1, 0, 0)
     def settings(self): return []
     def displayName(self): return "Modpack/" + self.title
     def tooltip(self): return self.description()
@@ -63,7 +74,9 @@ class Export(Base):
     title = "Export"
 
     def settings(self):
-        return [mobase.PluginSetting("max-mod-mb", "Mods larger than this (MB) are listed instead of copied; 0 = no limit", 0)]
+        return [mobase.PluginSetting("max-mod-mb", "Mods larger than this (MB) are listed instead of copied; 0 = no limit", 0),
+                mobase.PluginSetting("only-active", "Export only mods enabled in the current profile", True),
+                mobase.PluginSetting("list-replacers", "Also list mods without plugins/dlls (name + URL) in replacers.txt", True)]
 
     def display(self):
         out, _ = QFileDialog.getSaveFileName(self.w, "Export modpack", "modpack.zip", "Zip (*.zip)")
@@ -71,20 +84,26 @@ class Export(Base):
             return
         ml, manifest, replacers = self.o.modList(), [], []
         limit = int(self.o.pluginSetting(self.name(), "max-mod-mb"))
+        only_active = bool(self.o.pluginSetting(self.name(), "only-active"))
+        list_replacers = bool(self.o.pluginSetting(self.name(), "list-replacers"))
         names = ml.allModsByProfilePriority()
         bar = progress(self.w, "Exporting...", len(names))
-        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as z:
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=1, strict_timestamps=False) as z:
             for i, name in enumerate(names):
                 bar.setLabelText(name)
                 bar.setValue(i)
                 mod = ml.getMod(name)
                 if mod.isSeparator() or mod.isBackup() or mod.isForeign() or name == "CC Content":
                     continue
+                active = bool(ml.state(name) & mobase.ModState.ACTIVE)
+                if only_active and not active:
+                    continue
                 path = mod.absolutePath()
-                size_mb = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(path) for f in fs) / 2**20
-                full = has_code(path) and not (limit and size_mb > limit)
-                manifest.append({"name": name, "url": mod.url(), "full": full,
-                                 "enabled": bool(ml.state(name) & mobase.ModState.ACTIVE)})
+                code, size = scan(path, bool(limit))
+                if not code and not list_replacers:
+                    continue
+                full = code and not (limit and size / 2**20 > limit)
+                manifest.append({"name": name, "url": mod.url(), "full": full, "enabled": active})
                 if full:
                     add_tree(z, path, "mods/" + name)
                 else:
